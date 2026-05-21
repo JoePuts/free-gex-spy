@@ -1,10 +1,12 @@
 import pandas as pd
 import yfinance as yf
 import numpy as np
+from scipy.stats import norm
 from datetime import datetime
 import webbrowser
 import os
 import time
+import math
 
 # =========================================================
 # CONFIG
@@ -24,7 +26,8 @@ TICKERS = [
 OUTPUT_DIR = "gamma_dashboards"
 
 AUTO_REFRESH_SECONDS = 60
-EXPIRATION_COUNT = 3
+EXPIRATION_COUNT = 4
+RISK_FREE_RATE = 0.045
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -39,7 +42,292 @@ THEMES = {
     "AMZN": "#FFB347"
 }
 
-print("Starting Institutional Gamma Dashboard...")
+print("Starting REAL Institutional Gamma Dashboard...")
+
+# =========================================================
+# BLACK SCHOLES GAMMA
+# =========================================================
+
+def calculate_gamma(S, K, iv, T, r=0.045):
+
+    try:
+
+        if iv <= 0:
+            return 0
+
+        if T <= 0:
+            return 0
+
+        d1 = (
+            np.log(S / K)
+            + (r + 0.5 * iv**2) * T
+        ) / (iv * np.sqrt(T))
+
+        gamma = (
+            norm.pdf(d1)
+            /
+            (
+                S
+                * iv
+                * np.sqrt(T)
+            )
+        )
+
+        return gamma
+
+    except:
+        return 0
+
+# =========================================================
+# REAL GEX ENGINE
+# =========================================================
+
+def calculate_real_gex(df, spot, days_to_exp):
+
+    T = max(days_to_exp / 365, 0.002)
+
+    gex_values = []
+
+    for _, row in df.iterrows():
+
+        try:
+
+            strike = float(row['strike'])
+
+            oi = float(row.get('openInterest', 0))
+
+            volume = float(row.get('volume', 0))
+
+            iv = float(
+                row.get(
+                    'impliedVolatility',
+                    0.25
+                )
+            )
+
+            option_type = row['type']
+
+            gamma = calculate_gamma(
+                S=spot,
+                K=strike,
+                iv=iv,
+                T=T
+            )
+
+            # =================================================
+            # TRUE GAMMA EXPOSURE
+            # =================================================
+
+            gex = (
+                gamma
+                * oi
+                * 100
+                * spot
+                * spot
+                * 0.01
+            )
+
+            # =================================================
+            # VOLUME WEIGHTING
+            # =================================================
+
+            volume_weight = (
+                1
+                + min(volume / max(oi, 1), 3)
+            )
+
+            gex *= volume_weight
+
+            # =================================================
+            # DISTANCE WEIGHTING
+            # =================================================
+
+            distance_pct = (
+                abs(strike - spot)
+                / spot
+            )
+
+            distance_weight = math.exp(
+                -distance_pct * 8
+            )
+
+            gex *= distance_weight
+
+            # =================================================
+            # CALLS POSITIVE
+            # PUTS NEGATIVE
+            # =================================================
+
+            if option_type == 'put':
+                gex *= -1
+
+            gex_values.append(gex)
+
+        except:
+
+            gex_values.append(0)
+
+    df['gex'] = gex_values
+
+    return df
+
+# =========================================================
+# LEVEL ENGINE
+# =========================================================
+
+def calculate_levels(df, spot):
+
+    grouped = (
+        df.groupby('strike')['gex']
+        .sum()
+        .reset_index()
+        .sort_values('strike')
+    )
+
+    # =====================================================
+    # CALL WALL
+    # =====================================================
+
+    calls = grouped[grouped['gex'] > 0]
+
+    call_wall = None
+
+    if not calls.empty:
+
+        filtered_calls = calls[
+            calls['strike'] >= spot * 0.985
+        ]
+
+        if filtered_calls.empty:
+            filtered_calls = calls
+
+        call_wall = filtered_calls.loc[
+            filtered_calls['gex'].idxmax()
+        ]['strike']
+
+    # =====================================================
+    # PUT WALL
+    # =====================================================
+
+    puts = grouped[grouped['gex'] < 0]
+
+    put_wall = None
+
+    if not puts.empty:
+
+        filtered_puts = puts[
+            puts['strike'] <= spot * 1.015
+        ]
+
+        if filtered_puts.empty:
+            filtered_puts = puts
+
+        put_wall = filtered_puts.loc[
+            filtered_puts['gex'].idxmin()
+        ]['strike']
+
+    # =====================================================
+    # TRUE GAMMA FLIP
+    # =====================================================
+
+    grouped['net_gex'] = (
+        grouped['gex'].cumsum()
+    )
+
+    gamma_flip = None
+
+    for i in range(1, len(grouped)):
+
+        prev_val = grouped.iloc[i - 1]['net_gex']
+        curr_val = grouped.iloc[i]['net_gex']
+
+        if prev_val < 0 and curr_val > 0:
+
+            gamma_flip = grouped.iloc[i]['strike']
+            break
+
+    # FALLBACK
+
+    if gamma_flip is None:
+
+        closest = grouped.iloc[
+            grouped['net_gex'].abs().argsort()[:1]
+        ]
+
+        gamma_flip = closest['strike'].iloc[0]
+
+    return (
+        grouped,
+        call_wall,
+        put_wall,
+        gamma_flip
+    )
+
+# =========================================================
+# NODE CLASSIFICATION
+# =========================================================
+
+def classify_nodes(df):
+
+    df['is_gold'] = False
+    df['is_purple'] = False
+    df['is_teal'] = False
+
+    # =====================================================
+    # GOLD NODE
+    # MOST DEALER BUYING
+    # =====================================================
+
+    positive = df[df['gex'] > 0]
+
+    if not positive.empty:
+
+        gold_idx = positive['gex'].idxmax()
+
+        df.loc[
+            gold_idx,
+            'is_gold'
+        ] = True
+
+    # =====================================================
+    # PURPLE NODE
+    # MOST DEALER SELLING
+    # =====================================================
+
+    negative = df[df['gex'] < 0]
+
+    if not negative.empty:
+
+        purple_idx = negative['gex'].idxmin()
+
+        df.loc[
+            purple_idx,
+            'is_purple'
+        ] = True
+
+    # =====================================================
+    # TEAL NODES
+    # SECONDARY MAJOR LEVELS
+    # =====================================================
+
+    remaining = df[
+        (~df['is_gold'])
+        &
+        (~df['is_purple'])
+    ]
+
+    top_secondary = remaining.reindex(
+        remaining['gex'].abs().sort_values(
+            ascending=False
+        ).head(3).index
+    )
+
+    df.loc[
+        top_secondary.index,
+        'is_teal'
+    ] = True
+
+    return df
 
 # =========================================================
 # BUILD DASHBOARD
@@ -48,12 +336,12 @@ print("Starting Institutional Gamma Dashboard...")
 def build_heatmap(ticker_symbol):
 
     try:
+
         ticker = yf.Ticker(ticker_symbol)
 
         hist = ticker.history(period="1d")
 
         if hist.empty:
-            print(f"No data for {ticker_symbol}")
             return None
 
         current_price = hist['Close'].iloc[-1]
@@ -61,33 +349,33 @@ def build_heatmap(ticker_symbol):
         expirations = ticker.options[:EXPIRATION_COUNT]
 
     except Exception as e:
-        print(f"Error loading {ticker_symbol}: {e}")
+
+        print(f"ERROR {ticker_symbol}: {e}")
         return None
 
-    theme_color = THEMES.get(ticker_symbol, "#00FF88")
+    theme_color = THEMES.get(
+        ticker_symbol,
+        "#00FF88"
+    )
 
-    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    now_str = datetime.now().strftime(
+        '%Y-%m-%d %H:%M:%S'
+    )
 
     # =====================================================
-    # NAVBAR
+    # NAV BUTTONS
     # =====================================================
 
     nav_buttons = ""
 
     for t in TICKERS:
 
-        color = THEMES.get(t, "#666")
-
         nav_buttons += f'''
-        <a href="{t}_heatmap.html"
-           class="ticker-button"
-           style="border-color:{color};">
-           {t}
-        </a>
-        '''
+<a href="{t}_heatmap.html">{t}</a>
+'''
 
     # =====================================================
-    # HTML START
+    # HTML
     # =====================================================
 
     html = f'''
@@ -98,738 +386,583 @@ def build_heatmap(ticker_symbol):
 
 <title>{ticker_symbol} Gamma Dashboard</title>
 
-<meta http-equiv="refresh" content="{AUTO_REFRESH_SECONDS}">
+<meta http-equiv="refresh"
+      content="{AUTO_REFRESH_SECONDS}">
 
 <style>
 
-html {{
-    scroll-behavior: smooth;
-}}
-
 body {{
-    background: #050505;
-    color: white;
-    font-family: Arial;
-    margin: 0;
-    padding: 20px;
+    background:#030303;
+    color:white;
+    margin:0;
+    font-family:Arial;
 }}
 
-h1 {{
-    text-align: center;
-    color: {theme_color};
-    font-size: 42px;
-    margin-bottom: 10px;
-    letter-spacing: 1px;
+.sidebar {{
+    position:fixed;
+    left:0;
+    top:0;
+    bottom:0;
+    width:85px;
+    background:#050505;
+    border-right:1px solid #111;
+    z-index:99999;
+}}
+
+.sidebar a {{
+    display:block;
+    padding:22px 10px;
+    text-align:center;
+    color:#777;
+    text-decoration:none;
+    border-bottom:1px solid #111;
+    font-weight:900;
+}}
+
+.sidebar a:hover {{
+    background:#08151c;
+    color:white;
+}}
+
+.content {{
+    margin-left:85px;
+}}
+
+.topbar {{
+    position:sticky;
+    top:0;
+    background:rgba(0,0,0,.96);
+    z-index:9999;
+    padding:24px;
+    border-bottom:1px solid #111;
+    backdrop-filter:blur(8px);
+}}
+
+.title {{
+    text-align:center;
+    font-size:70px;
+    color:{theme_color};
+    font-weight:900;
 }}
 
 .timestamp {{
-    text-align: center;
-    color: #888;
-    margin-bottom: 20px;
-    font-size: 14px;
+    text-align:center;
+    color:#777;
+    margin-top:10px;
+    font-size:14px;
 }}
 
-.navbar {{
-    display: flex;
-    justify-content: center;
-    gap: 10px;
-    flex-wrap: wrap;
-    margin-bottom: 22px;
+.metrics {{
+    display:flex;
+    justify-content:center;
+    gap:18px;
+    margin-top:28px;
+    flex-wrap:wrap;
 }}
 
-.ticker-button {{
-    text-decoration: none;
-    color: white;
-    background: #111;
-    border: 2px solid #444;
-    padding: 10px 16px;
-    border-radius: 8px;
-    font-weight: bold;
-    transition: 0.2s;
-}}
-
-.ticker-button:hover {{
-    background: #1a1a1a;
-}}
-
-.metrics-bar {{
-
-    position: sticky;
-    top: 0;
-
-    z-index: 99999;
-
-    display: flex;
-    justify-content: center;
-    gap: 18px;
-    flex-wrap: wrap;
-
-    background: rgba(8,8,8,0.97);
-
-    padding: 14px;
-
-    margin-bottom: 24px;
-
-    border-bottom: 2px solid #222;
-
-    backdrop-filter: blur(10px);
-}}
-
-.metric-card {{
-    background: #101010;
-    border: 1px solid #222;
-    border-radius: 10px;
-    padding: 14px 22px;
-    min-width: 170px;
-    text-align: center;
+.metric {{
+    width:220px;
+    background:#050505;
+    border:1px solid #1a1a1a;
+    border-radius:20px;
+    padding:22px;
+    text-align:center;
 }}
 
 .metric-label {{
-    color: #777;
-    font-size: 12px;
-    margin-bottom: 6px;
-    letter-spacing: 1px;
+    color:#777;
+    font-size:13px;
 }}
 
 .metric-value {{
-    font-size: 28px;
-    font-weight: bold;
+    font-size:58px;
+    font-weight:900;
+    margin-top:8px;
 }}
 
-.price-value {{
-    color: #00FF88;
+.green {{ color:#00FF99; }}
+.blue {{ color:#19d3ff; }}
+.red {{ color:#ff4d5a; }}
+.yellow {{ color:#ffe600; }}
+
+.grid {{
+    display:grid;
+    grid-template-columns:repeat(4,1fr);
+    gap:12px;
+    padding:12px;
 }}
 
-.call-wall {{
-    color: #57D9FF;
+.panel {{
+    background:#050505;
+    border:1px solid #111;
 }}
 
-.put-wall {{
-    color: #FF5A5A;
+.exp-title {{
+    position:sticky;
+    top:205px;
+    background:#111;
+    text-align:center;
+    padding:10px;
+    font-weight:900;
+    z-index:500;
 }}
 
-.gamma-flip {{
-    color: #FFD700;
-}}
-
-.container {{
-    display: flex;
-    gap: 18px;
-    justify-content: center;
-    align-items: flex-start;
-    width: 100%;
-}}
-
-.day-section {{
-    flex: 1 1 32%;
-    min-width: 420px;
-}}
-
-h3 {{
-
-    text-align: center;
-
-    color: #ccc;
-
-    background: #101010;
-
-    padding: 12px;
-
-    position: sticky;
-
-    top: 110px;
-
-    z-index: 1000;
-
-    border-bottom: 2px solid #222;
-
-    margin: 0;
+.table-wrap {{
+    max-height:calc(100vh - 260px);
+    overflow:auto;
 }}
 
 table {{
-    width: 100%;
-    border-collapse: collapse;
-    background: #0d0d0d;
+    width:100%;
+    border-collapse:collapse;
 }}
 
-th, td {{
-    padding: 10px;
-    border-bottom: 1px solid #161616;
-    text-align: right;
+td {{
+    border-bottom:1px solid #111;
+    padding:10px;
+    font-weight:900;
 }}
 
-th {{
-    background: #111;
-    color: #aaa;
-}}
-
-.strike {{
-    background: #000;
-    font-weight: bold;
-}}
-
-.pct {{
-    text-align: center;
-    font-weight: bold;
-}}
-
-.bar {{
-    height: 28px;
-    border-radius: 2px;
+tr:hover {{
+    background:#07141d;
 }}
 
 .current {{
-    background: #161616 !important;
-    border-left: 4px solid white;
+    background:#05192a !important;
 }}
 
-.call-wall-row {{
-    border-left: 4px solid #57D9FF !important;
+.pct-red {{
+    background:#5a0000;
+    color:white;
+    text-align:center;
 }}
 
-.put-wall-row {{
-    border-left: 4px solid #FF5A5A !important;
+.pct-green {{
+    background:#004d00;
+    color:white;
+    text-align:center;
 }}
 
-.gamma-flip-row {{
-    border-left: 4px solid #FFD700 !important;
+.bar {{
+    height:30px;
+    border-radius:6px;
 }}
 
 @keyframes goldGlow {{
 
     0% {{
-        box-shadow: 0 0 8px #FFD700;
+        box-shadow:0 0 8px #ffe600;
     }}
 
     100% {{
-        box-shadow: 0 0 24px #FFD700;
+        box-shadow:0 0 30px #ffe600;
     }}
 }}
 
 @keyframes purpleGlow {{
 
     0% {{
-        box-shadow: 0 0 8px #8B00FF;
+        box-shadow:0 0 8px #b026ff;
     }}
 
     100% {{
-        box-shadow: 0 0 24px #AA00FF;
+        box-shadow:0 0 30px #b026ff;
     }}
 }}
 
 @keyframes tealGlow {{
 
     0% {{
-        box-shadow: 0 0 8px #00D4FF;
+        box-shadow:0 0 6px #19d3ff;
     }}
 
     100% {{
-        box-shadow: 0 0 20px #00FFFF;
+        box-shadow:0 0 24px #19d3ff;
     }}
 }}
 
-.kingpin {{
-    animation: goldGlow 1.3s infinite alternate;
+.gold {{
+    animation:goldGlow 1.2s infinite alternate;
 }}
 
-.purple-bar {{
-    animation: purpleGlow 1.4s infinite alternate;
+.purple {{
+    animation:purpleGlow 1.2s infinite alternate;
 }}
 
-.teal-bar {{
-    animation: tealGlow 1.5s infinite alternate;
-}}
-
-#topBtn {{
-
-    position: fixed;
-
-    bottom: 30px;
-
-    right: 30px;
-
-    z-index: 9999;
-
-    background: #111;
-
-    color: white;
-
-    border: 2px solid #666;
-
-    padding: 14px 18px;
-
-    border-radius: 12px;
-
-    cursor: pointer;
+.teal {{
+    animation:tealGlow 1.5s infinite alternate;
 }}
 
 #currentBtn {{
 
-    position: fixed;
+    position:fixed;
+    right:20px;
+    bottom:85px;
+    z-index:999999;
 
-    bottom: 95px;
+    background:#002b22;
 
-    right: 30px;
+    color:#00ff99;
 
-    z-index: 9999;
+    border:2px solid #00ff99;
 
-    background: #111;
+    padding:16px;
 
-    color: #00FF88;
+    border-radius:14px;
 
-    border: 2px solid #00FF88;
+    cursor:pointer;
 
-    padding: 14px 18px;
+    font-weight:900;
+}}
 
-    border-radius: 12px;
+#topBtn {{
 
-    cursor: pointer;
+    position:fixed;
+    right:20px;
+    bottom:20px;
+
+    z-index:999999;
+
+    background:#111;
+
+    color:white;
+
+    border:none;
+
+    padding:16px;
+
+    border-radius:14px;
+
+    cursor:pointer;
+
+    font-weight:900;
 }}
 
 </style>
 
 <script>
 
-function scrollToTop() {{
-    window.scrollTo({{
-        top: 0,
-        behavior: 'smooth'
-    }});
-}}
+function jumpCurrent() {{
 
-function jumpToCurrent() {{
-
-    const current = document.querySelector('.current');
+    const current =
+        document.querySelector('.current');
 
     if(current) {{
 
         current.scrollIntoView({{
-            behavior: 'smooth',
-            block: 'center'
+            behavior:'smooth',
+            block:'center'
         }});
     }}
+}}
+
+function topScroll() {{
+
+    window.scrollTo({{
+        top:0,
+        behavior:'smooth'
+    }});
 }}
 
 </script>
 
 </head>
 
-<body onload="jumpToCurrent()">
+<body onload="jumpCurrent()">
 
-<button id="topBtn" onclick="scrollToTop()">
-↑ TOP
-</button>
+<button id="currentBtn"
+        onclick="jumpCurrent()">
 
-<button id="currentBtn" onclick="jumpToCurrent()">
 🎯 CURRENT
+
 </button>
 
-<h1>{ticker_symbol} Gamma Dashboard</h1>
+<button id="topBtn"
+        onclick="topScroll()">
 
-<div class="timestamp">
-Price: <b>{current_price:.2f}</b>
-• Updated: {now_str}
-• Refresh: {AUTO_REFRESH_SECONDS}s
+↑ TOP
+
+</button>
+
+<div class="sidebar">
+
+{nav_buttons}
+
 </div>
 
-<div class="navbar">
-{nav_buttons}
+<div class="content">
+
+<div class="topbar">
+
+<div class="title">
+
+{ticker_symbol} Institutional Gamma Dashboard
+
+</div>
+
+<div class="timestamp">
+
+LIVE DATA • Updated {now_str}
+
 </div>
 '''
 
     first_exp = True
 
+    all_exp_data = []
+
     # =====================================================
-    # EXPIRATION LOOP
+    # EACH EXPIRATION
     # =====================================================
 
     for exp in expirations:
 
-        exp_date = (
+        try:
+
+            option_chain = ticker.option_chain(exp)
+
+            calls = option_chain.calls.copy()
+            puts = option_chain.puts.copy()
+
+            calls['type'] = 'call'
+            puts['type'] = 'put'
+
+            df = pd.concat([
+                calls,
+                puts
+            ])
+
+            exp_date = pd.to_datetime(exp)
+
+            days_to_exp = max(
+                (exp_date - pd.Timestamp.now()).days,
+                1
+            )
+
+            df = calculate_real_gex(
+                df,
+                current_price,
+                days_to_exp
+            )
+
+            grouped, call_wall, put_wall, gamma_flip = calculate_levels(
+                df,
+                current_price
+            )
+
+            grouped = classify_nodes(grouped)
+
+            grouped['pct'] = (
+                (
+                    grouped['strike']
+                    - current_price
+                )
+                / current_price
+                * 100
+            ).round(1)
+
+            grouped = grouped[
+                (
+                    grouped['strike']
+                    >= current_price * 0.94
+                )
+                &
+                (
+                    grouped['strike']
+                    <= current_price * 1.06
+                )
+            ]
+
+            grouped['distance'] = (
+                grouped['strike']
+                - current_price
+            ).abs()
+
+            current_idx = grouped[
+                'distance'
+            ].idxmin()
+
+            grouped['is_current'] = False
+
+            grouped.loc[
+                current_idx,
+                'is_current'
+            ] = True
+
+            all_exp_data.append({
+                'exp': exp,
+                'grouped': grouped,
+                'call_wall': call_wall,
+                'put_wall': put_wall,
+                'gamma_flip': gamma_flip
+            })
+
+            # =================================================
+            # TOP METRICS
+            # =================================================
+
+            if first_exp:
+
+                html += f'''
+
+<div class="metrics">
+
+<div class="metric">
+
+<div class="metric-label">
+LIVE PRICE
+</div>
+
+<div class="metric-value green">
+${current_price:.2f}
+</div>
+
+</div>
+
+<div class="metric">
+
+<div class="metric-label">
+CALL WALL
+</div>
+
+<div class="metric-value blue">
+{call_wall}
+</div>
+
+</div>
+
+<div class="metric">
+
+<div class="metric-label">
+PUT WALL
+</div>
+
+<div class="metric-value red">
+{put_wall}
+</div>
+
+</div>
+
+<div class="metric">
+
+<div class="metric-label">
+GAMMA FLIP
+</div>
+
+<div class="metric-value yellow">
+{gamma_flip}
+</div>
+
+</div>
+
+</div>
+'''
+
+                first_exp = False
+
+        except Exception as e:
+
+            print(f"EXP ERROR {exp}: {e}")
+
+    html += '''
+<div class="grid">
+'''
+
+    # =====================================================
+    # TABLES
+    # =====================================================
+
+    for exp_data in all_exp_data:
+
+        exp = exp_data['exp']
+        grouped = exp_data['grouped']
+
+        exp_label = (
             pd.to_datetime(exp)
             .strftime('%m/%d/%Y')
             .lstrip('0')
             .replace('/0', '/')
         )
 
-        opt = None
-
-        for attempt in range(3):
-
-            try:
-                opt = ticker.option_chain(exp)
-                break
-
-            except Exception:
-
-                print(f"Retry {attempt+1}/3 {ticker_symbol} {exp}")
-
-                time.sleep(2)
-
-        if opt is None:
-            continue
-
-        calls = opt.calls.copy()
-        puts = opt.puts.copy()
-
-        calls['type'] = 'call'
-        puts['type'] = 'put'
-
-        df_exp = pd.concat([calls, puts], ignore_index=True)
-
-        spot = current_price
-
-        # =================================================
-        # FLOW MODEL
-        # =================================================
-
-        df_exp['flow'] = (
-            df_exp['openInterest']
-            * 100
-            * spot
-            * np.where(df_exp['type'] == 'call', 1, -1)
-        )
-
-        heatmap_df = (
-            df_exp.groupby('strike')['flow']
-            .sum()
-            .reset_index()
-        )
-
-        heatmap_df = heatmap_df.sort_values('strike')
-
-        # =================================================
-        # WALLS
-        # =================================================
-
-        call_side = heatmap_df[heatmap_df['flow'] > 0]
-
-        put_side = heatmap_df[heatmap_df['flow'] < 0]
-
-        call_wall = None
-        put_wall = None
-        gamma_flip = None
-
-        if not call_side.empty:
-
-            call_wall = call_side.loc[
-                call_side['flow'].idxmax()
-            ]['strike']
-
-        if not put_side.empty:
-
-            put_wall = put_side.loc[
-                put_side['flow'].idxmin()
-            ]['strike']
-
-        heatmap_df['cumulative'] = (
-            heatmap_df['flow'].cumsum()
-        )
-
-        flip_candidates = heatmap_df[
-            heatmap_df['cumulative'] > 0
-        ]
-
-        if not flip_candidates.empty:
-
-            gamma_flip = flip_candidates.iloc[0]['strike']
-
-        # =================================================
-        # METRICS BAR
-        # =================================================
-
-        if first_exp:
-
-            html += f'''
-
-<div class="metrics-bar">
-
-<div class="metric-card">
-<div class="metric-label">LIVE PRICE</div>
-<div class="metric-value price-value">
-${current_price:.2f}
-</div>
-</div>
-
-<div class="metric-card">
-<div class="metric-label">CALL WALL</div>
-<div class="metric-value call-wall">
-{call_wall}
-</div>
-</div>
-
-<div class="metric-card">
-<div class="metric-label">PUT WALL</div>
-<div class="metric-value put-wall">
-{put_wall}
-</div>
-</div>
-
-<div class="metric-card">
-<div class="metric-label">GAMMA FLIP</div>
-<div class="metric-value gamma-flip">
-{gamma_flip}
-</div>
-</div>
-
-</div>
-
-<div class="container">
-'''
-
-            first_exp = False
-
-        # =================================================
-        # PERCENT DISTANCE
-        # =================================================
-
-        heatmap_df['pct'] = (
-            (
-                heatmap_df['strike']
-                - spot
-            )
-            / spot
-            * 100
-        ).round(1)
-
-        heatmap_df['pct_str'] = (
-            heatmap_df['pct'].astype(str)
-            + '%'
-        )
-
-        # =================================================
-        # SCALE FLOW
-        # =================================================
-
-        max_flow = heatmap_df['flow'].abs().max()
-
-        if max_flow > 0:
-
-            scale = 400_000_000 / max_flow
-
-            heatmap_df['flow'] *= scale
-
-        heatmap_df['flow_m'] = (
-            heatmap_df['flow'] / 1_000_000
-        ).round(1)
-
-        heatmap_df['dollar_str'] = (
-            heatmap_df['flow_m']
-            .apply(
-                lambda x:
-                f"${x:,.1f}M"
-                if x >= 0
-                else f"-${abs(x):,.1f}M"
-            )
-        )
-
-        # =================================================
-        # STRIKE FILTER
-        # =================================================
-
-        heatmap_df = heatmap_df[
-            (
-                heatmap_df['strike']
-                >= current_price * 0.88
-            )
-            &
-            (
-                heatmap_df['strike']
-                <= current_price * 1.12
-            )
-        ]
-
-        if heatmap_df.empty:
-            continue
-
-        # =================================================
-        # CURRENT PRICE TRACKER
-        # =================================================
-
-        heatmap_df['distance_to_price'] = (
-            heatmap_df['strike']
-            - current_price
-        ).abs()
-
-        current_idx = heatmap_df[
-            'distance_to_price'
-        ].idxmin()
-
-        heatmap_df['is_current'] = False
-
-        heatmap_df.loc[
-            current_idx,
-            'is_current'
-        ] = True
-
-        # =================================================
-        # NODE CLASSIFICATION
-        # =================================================
-
-        heatmap_df['is_king'] = False
-        heatmap_df['is_purple'] = False
-        heatmap_df['is_teal'] = False
-
-        # KINGPIN
-
-        max_abs_idx = (
-            heatmap_df['flow']
-            .abs()
-            .idxmax()
-        )
-
-        heatmap_df.loc[
-            max_abs_idx,
-            'is_king'
-        ] = True
-
-        # PURPLE NODE
-
-        negative_nodes = heatmap_df[
-            heatmap_df['flow'] < 0
-        ].copy()
-
-        negative_nodes = negative_nodes.drop(
-            index=max_abs_idx,
-            errors='ignore'
-        )
-
-        purple_idx = None
-
-        if not negative_nodes.empty:
-
-            purple_idx = (
-                negative_nodes['flow']
-                .idxmin()
-            )
-
-            heatmap_df.loc[
-                purple_idx,
-                'is_purple'
-            ] = True
-
-        # TEAL NODES
-
-        remaining_negatives = (
-            negative_nodes.drop(
-                index=purple_idx,
-                errors='ignore'
-            )
-        )
-
-        teal_count = min(3, len(remaining_negatives))
-
-        if teal_count > 0:
-
-            teal_indices = (
-                remaining_negatives
-                .sort_values('flow')
-                .head(teal_count)
-                .index
-            )
-
-            heatmap_df.loc[
-                teal_indices,
-                'is_teal'
-            ] = True
-
-        # =================================================
-        # BAR COLOR FUNCTION
-        # =================================================
-
-        def get_bar_color(
-            flow,
-            is_king,
-            is_purple,
-            is_teal
-        ):
-
-            if is_king:
-                return "#FFD700"
-
-            if is_purple:
-                return "#8B00FF"
-
-            if is_teal:
-                return "#00D4FF"
-
-            if flow < 0:
-                return "#FF4444"
-
-            return "#00FF88"
-
-        # =================================================
-        # HTML TABLE
-        # =================================================
+        max_gex = grouped['gex'].abs().max()
 
         html += f'''
-<div class="day-section">
+<div class="panel">
 
-<h3>{exp_date}</h3>
+<div class="exp-title">
+{exp_label}
+</div>
+
+<div class="table-wrap">
 
 <table>
-
-<tr>
-<th>STRIKE</th>
-<th>%</th>
-<th>GAMMA FLOW</th>
-</tr>
 '''
 
-        for _, row in heatmap_df.iterrows():
+        for _, row in grouped.iterrows():
+
+            strike = row['strike']
+            gex = row['gex']
 
             width = min(
-                abs(row['flow']) / 4_000_000,
+                abs(gex) / max_gex * 100,
                 100
             )
 
-            color = get_bar_color(
-                row['flow'],
-                row['is_king'],
-                row['is_purple'],
-                row['is_teal']
-            )
+            color = '#00ff99'
 
-            extra_class = ""
+            if gex < 0:
+                color = '#ff4d5a'
 
-            if row['is_king']:
-                extra_class = "kingpin"
+            extra = ''
+
+            if row['is_gold']:
+
+                color = '#ffe600'
+                extra = 'gold'
 
             elif row['is_purple']:
-                extra_class = "purple-bar"
+
+                color = '#b026ff'
+                extra = 'purple'
 
             elif row['is_teal']:
-                extra_class = "teal-bar"
 
-            row_class = ""
+                color = '#19d3ff'
+                extra = 'teal'
+
+            pct_class = 'pct-green'
+
+            if row['pct'] < 0:
+                pct_class = 'pct-red'
+
+            row_class = ''
 
             if row['is_current']:
-                row_class += " current"
-
-            if row['strike'] == call_wall:
-                row_class += " call-wall-row"
-
-            if row['strike'] == put_wall:
-                row_class += " put-wall-row"
-
-            if row['strike'] == gamma_flip:
-                row_class += " gamma-flip-row"
+                row_class = 'current'
 
             html += f'''
 <tr class="{row_class}">
 
-<td class="strike">
-{row['strike']}
+<td style="
+width:95px;
+font-size:18px;
+">
+
+{strike:.1f}
+
 </td>
 
-<td class="pct">
-{row['pct_str']}
+<td class="{pct_class}"
+    style="width:90px;">
+
+{row['pct']:.1f}%
+
 </td>
 
 <td>
 
 <div
-class="bar {extra_class}"
+class="bar {extra}"
 style="
 width:{width}%;
 background:{color};
@@ -837,11 +970,14 @@ background:{color};
 </div>
 
 <div style="
-margin-top:4px;
-font-size:12px;
+text-align:right;
+font-size:11px;
 color:#aaa;
+margin-top:3px;
 ">
-{row['dollar_str']}
+
+${gex/1000000:.1f}M
+
 </div>
 
 </td>
@@ -851,29 +987,36 @@ color:#aaa;
 
         html += '''
 </table>
+
+</div>
+
 </div>
 '''
 
     html += '''
 </div>
+
+</div>
+
 </body>
+
 </html>
 '''
-
-    # =====================================================
-    # SAVE FILE
-    # =====================================================
 
     filepath = os.path.join(
         OUTPUT_DIR,
         f"{ticker_symbol}_heatmap.html"
     )
 
-    with open(filepath, "w", encoding="utf-8") as f:
+    with open(
+        filepath,
+        "w",
+        encoding="utf-8"
+    ) as f:
 
         f.write(html)
 
-    print(f"Built {filepath}")
+    print(f"BUILT {ticker_symbol}")
 
     return filepath
 
@@ -885,18 +1028,17 @@ opened = False
 
 while True:
 
-    print(
-        f"\nRefreshing dashboards..."
-    )
+    print("Refreshing dashboards...")
 
     first_file = None
 
-    for ticker in TICKERS:
+    for ticker_symbol in TICKERS:
 
-        filepath = build_heatmap(ticker)
+        filepath = build_heatmap(
+            ticker_symbol
+        )
 
         if filepath and first_file is None:
-
             first_file = filepath
 
     if first_file and not opened:
